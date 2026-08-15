@@ -17,7 +17,7 @@ import sys
 
 from groq import Groq
 
-PROXY_BASE_URL = "http://localhost:8788/v1"
+PROXY_BASE_URL = "http://localhost:8788"
 MODEL = "llama-3.1-8b-instant"
 
 client = Groq(api_key="unused-proxy-handles-auth", base_url=PROXY_BASE_URL)

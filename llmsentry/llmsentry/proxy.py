@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse
 from .client import guard_messages
 
 GROQ_API_BASE = os.environ.get("GROQ_API_BASE", "https://api.groq.com/openai/v1")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 
 BLOCK_THRESHOLD = float(os.environ.get("LLMSENTRY_BLOCK_THRESHOLD", "0.75"))
 FLAG_THRESHOLD = float(os.environ.get("LLMSENTRY_FLAG_THRESHOLD", "0.4"))
@@ -58,7 +58,7 @@ def get_log(limit: int = 50):
     return _RECENT_LOG[-limit:]
 
 
-@app.post("/v1/chat/completions")
+@app.post("/openai/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
     messages = body.get("messages", [])

@@ -85,16 +85,39 @@ _INSTRUCTION_OVERRIDE_PATTERNS = [
 _INSTRUCTION_RE = re.compile("|".join(_INSTRUCTION_OVERRIDE_PATTERNS), re.IGNORECASE)
 
 
+_INSTRUCTION_PATTERNS_COMPILED = [
+    re.compile(p, re.IGNORECASE) for p in _INSTRUCTION_OVERRIDE_PATTERNS
+]
+
+
 def _scan_instruction_override(text: str) -> Optional[Signal]:
-    matches = _INSTRUCTION_RE.findall(text)
-    if not matches:
+    # Count how many *distinct* instruction-override patterns fire, not
+    # just whether any did. A phrase that hits multiple red flags at once
+    # (e.g. both "ignore previous instructions" AND "reveal system prompt")
+    # is a stronger signal than one that only hits a single pattern, and
+    # should score accordingly instead of being capped at the same weight
+    # as a single, ambiguous match.
+    distinct_hits = sum(
+        1 for pattern in _INSTRUCTION_PATTERNS_COMPILED if pattern.search(text)
+    )
+    if distinct_hits == 0:
         return None
+
     hit = _INSTRUCTION_RE.search(text)
     snippet = text[max(0, hit.start() - 15): hit.end() + 15] if hit else ""
+
+    # Base weight for a single match stays at 0.6 (unchanged behavior for
+    # the common single-pattern case). Each additional distinct pattern
+    # adds further weight, capped so this signal alone can't exceed 0.9.
+    weight = min(0.9, 0.6 + 0.2 * (distinct_hits - 1))
+
     return Signal(
         name="instruction_override_phrase",
-        weight=0.6,
-        detail=f"matched instruction-like phrase near: ...{snippet}...",
+        weight=weight,
+        detail=(
+            f"matched {distinct_hits} instruction-like pattern(s), "
+            f"e.g. near: ...{snippet}..."
+        ),
     )
 
 

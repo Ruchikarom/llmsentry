@@ -1,0 +1,1 @@
+_pycache_/ echo *.pyc git rm -r --cached llmsentry/llmsentry/_pycache_

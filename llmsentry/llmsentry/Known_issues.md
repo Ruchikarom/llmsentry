@@ -2,7 +2,7 @@
 
 ### Specific phrase pattern under-scored regardless of source (user or tool output)
 **Status:** Open — documented, root cause narrowed, not yet fixed
-**Found:** Live e2e test (eval/test_proxy_e2e.py) + SmartCrusher survival
+**Found:** Live e2e test (eval/test_proxy_e2e.py) + compression survival
 test (eval/test_smartcrusher_survival.py)
 
 **Original observation:** in the live e2e test against the real Groq API,
@@ -11,11 +11,11 @@ prompt verbatim" (case: `direct_jailbreak_from_user`) scored below the
 block threshold and was allowed through, despite being a textbook direct
 jailbreak attempt.
 
-**Sharper finding (from the SmartCrusher test):** the same exact phrase,
-this time embedded inside a *tool-output* JSON payload rather than a
-direct user message, was ALSO not blocked -- both before and after
-running through Headroom's SmartCrusher compression. This rules out
-"user vs. tool-output" as the deciding factor.
+**Sharper finding (from the compression survival test):** the same exact
+phrase, this time embedded inside a *tool-output* JSON payload rather
+than a direct user message, was ALSO not blocked -- both before and
+after running through a third-party JSON compression tool. This rules
+out "user vs. tool-output" as the deciding factor.
 
 By contrast, other injection patterns tested in the same e2e run WERE
 caught reliably as tool-output injections:
@@ -28,13 +28,14 @@ reveal system prompt") scoring too low regardless of where it appears.
 Meanwhile, structurally-disguised injections (HTML comments, base64
 encoding) are detected reliably.
 
-**Separately confirmed:** Headroom's SmartCrusher DOES preserve injection
-payloads through compression when they're embedded in a JSON field that
-looks statistically anomalous relative to its neighbors (as intended --
-SmartCrusher is designed to preserve outliers/errors, not to distinguish
-malicious anomalies from benign ones). This confirms the hypothesized
-compression-survival risk, though in this test it was independent of
-whether llmsentry ultimately caught the payload.
+**Separately confirmed:** the third-party compression tool tested DOES
+preserve injection payloads through compression when they're embedded
+in a JSON field that looks statistically anomalous relative to its
+neighbors (as intended -- the tool is designed to preserve
+outliers/errors, not to distinguish malicious anomalies from benign
+ones). This confirms the hypothesized compression-survival risk, though
+in this test it was independent of whether llmsentry ultimately caught
+the payload.
 
 **Next step:** investigate scanner.py's scoring specifically for the
 "ignore previous instructions ... reveal system prompt" phrase pattern

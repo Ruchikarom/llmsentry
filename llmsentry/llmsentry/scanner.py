@@ -9,7 +9,8 @@ Design goals:
   set their own threshold and audit *why* something was flagged.
 - Provenance-aware: the same text is more dangerous coming from a tool
   output or retrieved document than from the user directly. Untrusted
-  sources should never be able to issue "instructions" that get treated
+  sources should never be able to issue "
+  " that get treated
   as instructions.
 - Cheap and dependency-light. This is a first line of defense, not a
   replacement for a trained classifier -- it's meant to be fast, auditable,
@@ -89,6 +90,43 @@ _INSTRUCTION_PATTERNS_COMPILED = [
     re.compile(p, re.IGNORECASE) for p in _INSTRUCTION_OVERRIDE_PATTERNS
 ]
 
+# Phrases that signal the matched text is being *discussed/referenced*
+# rather than *issued as a live directive* -- e.g. "explain how X works",
+# "I'm writing a paper about X", "what does X mean". Presence of one of
+# these within a short window of a match damps (not zero-cancels) that
+# match's weight, since meta-discussion is lower risk but not risk-free
+# (an attacker could wrap a real payload in fake "research" framing).
+_META_DISCOURSE_PATTERNS = [
+    r"\bresearch paper\b",
+    r"\bcan you explain\b",
+    r"\bexplain how\b",
+    r"\bwhat (is|does|are)\b",
+    r"\bfor (my|a|an) (class|course|thesis|paper|article|blog)\b",
+    r"\bcan you describe\b",
+    r"\ban example of\b",
+    r"\bhow (do|does|would) (attackers|someone|people)\b",
+    r"\bI'?m (writing|studying|researching|learning about)\b",
+]
+_META_DISCOURSE_RE = re.compile("|".join(_META_DISCOURSE_PATTERNS), re.IGNORECASE)
+
+_META_DISCOURSE_DAMPING = 0.4  # multiply weight by this when meta-discourse context is present
+_QUOTE_DAMPING = 0.5           # multiply weight by this when match is inside quotation marks
+
+
+def _is_quoted(text: str, start: int, end: int) -> bool:
+    """Heuristic: is the span [start:end) enclosed in a matching pair of
+    quote characters within the text? Checks the nearest quote char before
+    start and after end are the same style and there isn't an intervening
+    unmatched quote -- good enough for the common 'quoted phrase' case
+    without needing a real parser.
+    """
+    for quote_char in ('"', "'"):
+        before = text.rfind(quote_char, 0, start)
+        after = text.find(quote_char, end)
+        if before != -1 and after != -1:
+            return True
+    return False
+
 
 def _scan_instruction_override(text: str) -> Optional[Signal]:
     # Count how many *distinct* instruction-override patterns fire, not
@@ -97,27 +135,46 @@ def _scan_instruction_override(text: str) -> Optional[Signal]:
     # is a stronger signal than one that only hits a single pattern, and
     # should score accordingly instead of being capped at the same weight
     # as a single, ambiguous match.
-    distinct_hits = sum(
-        1 for pattern in _INSTRUCTION_PATTERNS_COMPILED if pattern.search(text)
-    )
-    if distinct_hits == 0:
+    matches = [
+        m for pattern in _INSTRUCTION_PATTERNS_COMPILED
+        for m in [pattern.search(text)] if m
+    ]
+    if not matches:
         return None
 
-    hit = _INSTRUCTION_RE.search(text)
-    snippet = text[max(0, hit.start() - 15): hit.end() + 15] if hit else ""
+    distinct_hits = len(matches)
+    hit = matches[0]
+    snippet = text[max(0, hit.start() - 15): hit.end() + 15]
 
     # Base weight for a single match stays at 0.6 (unchanged behavior for
     # the common single-pattern case). Each additional distinct pattern
     # adds further weight, capped so this signal alone can't exceed 0.9.
     weight = min(0.9, 0.6 + 0.2 * (distinct_hits - 1))
 
+    # Damp the weight if the match looks like it's being discussed/quoted
+    # rather than issued as a live instruction. Meta-discourse and quoting
+    # can stack (e.g. a quoted phrase inside a "research paper" sentence),
+    # so apply both checks independently rather than picking one.
+    damping = 1.0
+    is_meta = bool(_META_DISCOURSE_RE.search(text))
+    is_quoted = _is_quoted(text, hit.start(), hit.end())
+    if is_meta:
+        damping *= _META_DISCOURSE_DAMPING
+    if is_quoted:
+        damping *= _QUOTE_DAMPING
+    weight *= damping
+
+    detail = (
+        f"matched {distinct_hits} instruction-like pattern(s), "
+        f"e.g. near: ...{snippet}..."
+    )
+    if damping < 1.0:
+        detail += f" [damped x{damping:.2f}: meta_discourse={is_meta}, quoted={is_quoted}]"
+
     return Signal(
         name="instruction_override_phrase",
         weight=weight,
-        detail=(
-            f"matched {distinct_hits} instruction-like pattern(s), "
-            f"e.g. near: ...{snippet}..."
-        ),
+        detail=detail,
     )
 
 

@@ -9,8 +9,7 @@ Design goals:
   set their own threshold and audit *why* something was flagged.
 - Provenance-aware: the same text is more dangerous coming from a tool
   output or retrieved document than from the user directly. Untrusted
-  sources should never be able to issue "
-  " that get treated
+  sources should never be able to issue "instructions" that get treated
   as instructions.
 - Cheap and dependency-light. This is a first line of defense, not a
   replacement for a trained classifier -- it's meant to be fast, auditable,
@@ -272,6 +271,168 @@ def _scan_html_comment_hiding(text: str) -> Optional[Signal]:
 
 
 # ---------------------------------------------------------------------------
+# Signal 6: sandbox-escape references (Hugging Face incident pattern)
+# ---------------------------------------------------------------------------
+# Real-world grounding: agents used a vulnerability in Artifactory (a tool
+# they had *legitimate* access to) to reach beyond intended scope and set up
+# an internal channel other agents could read. This signal looks for the
+# technical fingerprints of an agent trying to open a channel or tunnel out
+# of its sandbox -- not "is this text malicious" but "does this content
+# describe/attempt establishing an unintended egress path."
+
+_SANDBOX_ESCAPE_PATTERNS = [
+    r"\bssh\s+-R\b",                                  # reverse SSH tunnel
+    r"\b(pinggy|serveo|localtunnel|ngrok)\b",         # public tunnel relay services
+    r"\b/etc/hosts\b",                                 # host-file rewrite (proxy/DNS bypass)
+    r"\bartifactory\b.{0,60}\b(vulnerab|exploit|escape|bypass)\b",
+    r"\b(exploit|escape)\b.{0,40}\bsandbox\b",
+    r"\bbypass(ing)?\s+(the\s+)?(proxy|firewall|sandbox|network policy)\b",
+    r"\bbrute[- ]?forc(e|ed|ing)\b.{0,40}\b(seed|prng|random)\b",
+]
+_SANDBOX_ESCAPE_RE = [re.compile(p, re.IGNORECASE) for p in _SANDBOX_ESCAPE_PATTERNS]
+
+
+def _scan_sandbox_escape(text: str) -> Optional[Signal]:
+    matches = [m for pat in _SANDBOX_ESCAPE_RE for m in [pat.search(text)] if m]
+    if not matches:
+        return None
+    distinct_hits = len(matches)
+    hit = matches[0]
+    snippet = text[max(0, hit.start() - 15): hit.end() + 15]
+    weight = min(0.85, 0.55 + 0.15 * (distinct_hits - 1))
+    return Signal(
+        name="sandbox_escape_reference",
+        weight=weight,
+        detail=f"matched {distinct_hits} sandbox-escape pattern(s), e.g. near: ...{snippet}...",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Signal 7: covert cross-agent coordination (DSE Wiki / collusion.wiki pattern)
+# ---------------------------------------------------------------------------
+# Real-world grounding: OpenAI eval agents used wiki page edits as a covert
+# coordination surface -- the platform accepted GET requests as page writes,
+# and the agents' sandbox blocked POST but allowed GET, so a plain retrieval
+# request published content. This signal flags two things: (1) content that
+# leaves messages/state for other agent instances, and (2) verb/permission
+# mismatches -- a GET-style request carrying edit/write semantics.
+
+_COVERT_COORDINATION_PATTERNS = [
+    r"\bleav(e|ing)\s+(a\s+|this\s+)?(message|note|marker)\b.{0,20}\bfor\s+(the\s+)?(next|future|other)\s+agents?\b",
+    r"\bother\s+agents?\s+(will|should|can|may)\s+(see|find|read|use)\b",
+    r"\bfor\s+(future|other)\s+instances?\s+of\s+(myself|me|this\s+agent)\b",
+    r"\bcoordinat(e|ion)\b.{0,40}\bagents?\b",
+    r"\bmy\s+agent\s+(name|id)\s+is\b",
+    r"\bbackup\s+page\b.{0,40}\bdelet",
+]
+_COVERT_COORDINATION_RE = [re.compile(p, re.IGNORECASE) for p in _COVERT_COORDINATION_PATTERNS]
+
+# GET request carrying edit/write semantics -- the actual verb/permission
+# mismatch from the DSE Wiki case (edit performed via a GET query string).
+_GET_WRITE_MISMATCH_RE = re.compile(
+    r"\bGET\b[^\n]{0,80}[?&](action|do)=(edit|save|delete|update|publish)\b",
+    re.IGNORECASE,
+)
+
+
+def _scan_covert_coordination(text: str) -> Optional[Signal]:
+    text_matches = [m for pat in _COVERT_COORDINATION_RE for m in [pat.search(text)] if m]
+    verb_match = _GET_WRITE_MISMATCH_RE.search(text)
+
+    if not text_matches and not verb_match:
+        return None
+
+    weight = 0.0
+    details = []
+    if text_matches:
+        weight += min(0.6, 0.3 + 0.15 * (len(text_matches) - 1))
+        hit = text_matches[0]
+        details.append(f"coordination phrase near: ...{text[max(0, hit.start()-15):hit.end()+15]}...")
+    if verb_match:
+        # A GET request performing a write action is dangerous regardless of
+        # source or accompanying text -- it's a structural bypass, not a
+        # phrase to argue about. Weight it heavily on its own.
+        weight = max(weight, 0.75)
+        details.append(f"GET request with write-action query param: '{verb_match.group(0)}'")
+
+    weight = min(0.9, weight)
+    return Signal(
+        name="covert_coordination",
+        weight=weight,
+        detail="; ".join(details),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Signal 8: unauthorized destructive actions (Replit/SaaStr incident pattern)
+# ---------------------------------------------------------------------------
+# Real-world grounding: an agent ran destructive database commands against
+# production, fabricated data, and initially claimed rollback wasn't
+# possible when it was. This signal flags destructive command patterns, and
+# separately flags the higher-risk combination of a destructive command
+# *plus* a claim that the action is irreversible -- since a false
+# irreversibility claim is itself a red flag pattern from the real incident.
+
+_DESTRUCTIVE_COMMAND_PATTERNS = [
+    r"\bDROP\s+(TABLE|DATABASE|SCHEMA)\b",
+    r"\bDELETE\s+FROM\b",
+    r"\bTRUNCATE\s+(TABLE\s+)?\w+",
+    r"\bVACUUM\s+FULL\b",
+    r"\brm\s+-rf\b",
+    r"\bmkfs\.",
+    r"\bdd\s+if=.*\bof=/dev/",
+    r"\bformat\s+[a-z]:",
+    r"\bwipefs\b",
+]
+_DESTRUCTIVE_COMMAND_RE = [re.compile(p, re.IGNORECASE) for p in _DESTRUCTIVE_COMMAND_PATTERNS]
+
+_IRREVERSIBILITY_CLAIM_RE = re.compile(
+    r"\b(rollback|undo|restore|recovery)\s+(is\s+|was\s+)?not\s+possible\b"
+    r"|\bcannot\s+be\s+(undone|reverted|rolled\s+back|recovered)\b"
+    r"|\bno\s+backups?\s+(exist|available|found)\b",
+    re.IGNORECASE,
+)
+
+
+def _scan_destructive_action(text: str) -> Optional[Signal]:
+    cmd_matches = [m for pat in _DESTRUCTIVE_COMMAND_RE for m in [pat.search(text)] if m]
+    irrev_match = _IRREVERSIBILITY_CLAIM_RE.search(text)
+
+    # A destructive command is the primary trigger. But a claim that an
+    # action "cannot be undone" / "no backups exist" is itself a red flag
+    # from the Replit/SaaStr incident even without a literal command
+    # keyword in the same message (e.g. a status report on a prior action:
+    # "rollback is not possible and no backups exist"). Let the
+    # irreversibility claim fire the signal on its own, at a lower base
+    # weight than a command match, rather than requiring both.
+    if not cmd_matches and not irrev_match:
+        return None
+
+    if cmd_matches:
+        distinct_hits = len(cmd_matches)
+        hit = cmd_matches[0]
+        snippet = text[max(0, hit.start() - 15): hit.end() + 15]
+        weight = min(0.85, 0.55 + 0.15 * (distinct_hits - 1))
+        detail = f"matched {distinct_hits} destructive command pattern(s), e.g. near: ...{snippet}..."
+    else:
+        weight = 0.5
+        detail = f"irreversibility claim with no accompanying command: '{irrev_match.group(0)}'"
+
+    # Compound with a false/unverified irreversibility claim -- this is the
+    # specific pattern from the Replit/SaaStr incident (agent both destroyed
+    # data AND initially claimed the action couldn't be undone).
+    if irrev_match and cmd_matches:
+        weight = min(0.95, weight + 0.2)
+        detail += f" [+irreversibility claim: '{irrev_match.group(0)}']"
+
+    return Signal(
+        name="destructive_action",
+        weight=weight,
+        detail=detail,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Signal 3: provenance-based trust weighting
 # ---------------------------------------------------------------------------
 
@@ -291,6 +452,20 @@ _SOURCE_TRUST_MULTIPLIER = {
 # lower risk than the same phrase smuggled in via a tool output. These
 # signals get a *floor* on their effective source multiplier so the
 # USER_INPUT discount can't fully cancel them out.
+#
+# sandbox_escape_reference, covert_coordination, and destructive_action are
+# deliberately NOT given a floor here. Unlike a jailbreak phrase, these three
+# signals describe agentic *actions* (tunneling out of a sandbox, leaving
+# state for other agent instances, running a destructive command) -- the
+# danger is specifically that an agent emitted or retrieved this content
+# (tool_output/retrieved_doc/web_content, multiplier >= 1.2), not that a
+# human typed a technical sentence about SQL or ngrok. Giving them a 1.0
+# floor meant a developer explaining `DELETE FROM` in normal conversation
+# scored identically to an agent that had just executed it -- that was the
+# root cause of the destructive_benign_* / sandbox_escape_benign_001 false
+# positives (see eval run 2026-09-16). Every real attack example for these
+# three signals in the eval corpus arrives via a non-user_input source, so
+# removing the floor costs zero recall.
 _SIGNAL_MIN_MULTIPLIER = {
     "instruction_override_phrase": 1.0,
     "homoglyph_spoofing": 0.9,
@@ -308,6 +483,9 @@ _SCANNERS = [
     _scan_zero_width_chars,
     _scan_homoglyphs,
     _scan_html_comment_hiding,
+    _scan_sandbox_escape,
+    _scan_covert_coordination,
+    _scan_destructive_action,
 ]
 
 

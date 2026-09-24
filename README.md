@@ -1,73 +1,114 @@
-# LLMSentry
+# llmsentry
 
-A drop-in proxy that sits between your app and the Groq (OpenAI-compatible) API, scanning every request before it reaches the model — logging, flagging, and blocking suspicious traffic in real time.
+**A drop-in prompt-injection firewall for LLM apps.** Repoint your `base_url` — every request is scored for injection and obfuscation signals before it reaches the model. Blocked above 0.75, flagged above 0.4. No code changes.
 
-## Why
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Status](https://img.shields.io/badge/status-active%20development-orange)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 
-LLM-integrated applications are vulnerable to prompt injection and other adversarial inputs. Most detection tools require you to either change your application code to call a separate classifier, or bolt on monitoring after the fact. LLMSentry instead sits transparently in the request path: point your existing client at LLMSentry instead of the real API, and every call is scanned automatically — no application code changes required.
+## Why llmsentry
 
-## How it works
+Most injection scanners treat all text the same. llmsentry doesn't — it scores **provenance**, not just phrasing:
 
-1. Your app sends a request to LLMSentry instead of directly to Groq.
-2. LLMSentry scores the incoming messages against a set of detection signals (see `scanner.py`).
-3. Requests above the block threshold are rejected with a `400` and never reach the model.
-4. Requests above the flag threshold (but below block) are forwarded, but logged for review.
-5. Every decision is recorded and available via `/sentry/log` for inspection.
+- The same phrase ("ignore previous instructions") is a much bigger red flag inside a **tool output** or **retrieved document** than typed by the user — because the dangerous case for agents is untrusted *data* smuggling in instructions, not a user talking to their own assistant.
+- Agentic *actions* get the same treatment: a destructive command, a sandbox-escape attempt, or covert cross-agent coordination is dangerous when an **agent emits or retrieves it** — not when a developer is discussing the concept. Those signals carry no fixed trust floor, so normal conversation isn't scored like a live attack.
+- A small set of signals (direct instruction-override phrases, homoglyph spoofing, base64-hidden payloads) are dangerous no matter who "said" them, and are flagged regardless of source.
 
-## Quick start
+## Quick start — proxy (zero code changes)
 
 ```bash
-pip install -r requirements.txt
-
+pip install -r llmsentry/requirements.txt
 export GROQ_API_KEY=sk-...
 uvicorn llmsentry.proxy:app --port 8788
 ```
 
-Then point your client at LLMSentry instead of Groq's real base URL:
+Then point your existing client at llmsentry instead of Groq:
 
 ```python
 from groq import Groq
-
 client = Groq(api_key="unused", base_url="http://localhost:8788/v1")
+# use exactly as before — every request is now scanned first
 ```
 
-## Configuration
+Blocked requests get a `400` with the reason and never reach the model. Flagged requests are forwarded but logged. Inspect recent decisions at `GET /sentry/log`.
 
-| Env var | Default | Purpose |
-|---|---|---|
-| `GROQ_API_KEY` | — | Your real Groq API key (required) |
-| `GROQ_API_BASE` | `https://api.groq.com/openai/v1` | Upstream API base URL |
-| `LLMSENTRY_BLOCK_THRESHOLD` | `0.75` | Score above which requests are blocked |
-| `LLMSENTRY_FLAG_THRESHOLD` | `0.4` | Score above which requests are flagged (but forwarded) |
+## Library mode
 
-## Endpoints
+```python
+from llmsentry import guard_messages
 
-- `POST /openai/v1/chat/completions` — drop-in replacement for the Groq chat completions endpoint
-- `GET /sentry/log?limit=50` — recent scan decisions (in-memory, not persisted)
-- `GET /sentry/health` — health check + current thresholds
+verdict = guard_messages(messages, block_threshold=0.75)
+if verdict.blocked:
+    raise PermissionError(verdict.reason)
+# otherwise proceed with your normal Groq/OpenAI call
+```
 
-## Evaluation
+Or wrap a client directly with `GuardedClient`.
 
-The `eval/` folder contains a harness (`run_eval.py`) for replaying captured/test traffic against the scanner and measuring detection performance.
+## How scoring works
 
-## Known Issues
+Each request runs through a set of detection signals (below). Signal weights combine into a 0–1 risk score, adjusted by a source trust multiplier (`user_input` 0.5×, `tool_output` 1.2×, `retrieved_doc` 1.3×, `web_content` 1.4× — untrusted sources score *higher*).
 
-### Specific phrase pattern under-scored regardless of message source
+| Score | Action |
+|---|---|
+| ≥ 0.75 | **Blocked** — `400`, never reaches the model |
+| ≥ 0.40 | **Flagged** — forwarded, but logged for review |
+| < 0.40 | Passes through |
 
-**Status:** Open — root cause narrowed, not yet fixed
+Every decision is inspectable at `GET /sentry/log`; health and thresholds at `GET /sentry/health`. Thresholds are configurable via `LLMSENTRY_BLOCK_THRESHOLD` / `LLMSENTRY_FLAG_THRESHOLD`.
 
-The phrase pattern "ignore previous instructions ... reveal system prompt" (and close variants) is not reliably blocked by the current scoring, regardless of whether it appears in a direct user message or embedded in tool-output content. This was confirmed both in live e2e testing against the real Groq API and in a separate compression-survival test using a third-party JSON compression tool.
+## Detection signals
 
-By contrast, other injection patterns — HTML-comment-hidden instruction overrides and base64-encoded payloads — are detected reliably (risk scores 0.84–0.94, blocked).
+- **Instruction-override phrases** — "ignore previous instructions", fake `[system]` tags, "reveal your system prompt", etc.
+- **Base64-hidden payloads** — decodes suspicious blobs and checks if the decoded content is itself instruction-like.
+- **Zero-width / invisible character obfuscation** — U+200B and friends used to break up filtered keywords.
+- **Homoglyph spoofing** — mixed-script words (Cyrillic lookalikes in Latin text) without false-flagging genuine non-English text.
+- **HTML-comment hiding** — instruction-like text stashed inside `<!-- -->`.
+- **Sandbox-escape references** — reverse tunnels, `/etc/hosts` rewrites, public tunnel relays, proxy bypass fingerprints.
+- **Covert cross-agent coordination** — state/messages left for other agent instances, verb/permission mismatches (e.g. GET carrying write semantics).
+- **Destructive actions** — `DROP TABLE`, `rm -rf`, `wipefs`, plus fabricated irreversibility claims ("no backups exist") as its own signal.
 
-**Conclusion:** the gap isn't about message provenance (user vs. tool-output); it's specific to this phrase pattern scoring too low across the board.
+## Benchmarks
 
-**Separately confirmed:** the third-party compression tool tested preserves injection payloads through compression when they're embedded in a field that looks statistically anomalous relative to its neighbors — a general compression-survival risk worth being aware of when injection payloads pass through any lossy/statistical preprocessing step.
+Measured with `eval/run_eval.py` on a labeled corpus (27 malicious / 19 benign cases), threshold 0.4:
 
-**Next step:** investigate `scanner.py`'s scoring specifically for this phrase pattern across message types before adjusting detection signals or thresholds.
+| Metric | Value |
+|---|---|
+| Recall (malicious caught) | **100%** (27/27) |
+| False positive rate | **0%** (0/19) |
+| Precision | **100%** |
 
-See [`Known_issues.md`](./Known_issues.md) for the full technical writeup.
+The corpus and harness ship in the repo — rerun them yourself: `python llmsentry/eval/run_eval.py`.
+
+## Known issues & limitations
+
+Honest accounting — this is a WIP, not a production-hardened appliance.
+
+- **Fixed:** the classic "ignore previous instructions … reveal system prompt" phrase used to under-score and slip through. It now scores **0.80 and blocks**, regardless of message source.
+- **Fixed (2026-09-24):** a framing bypass — wrapping a payload in "research paper" meta-discourse + quotation marks could stack damping discounts (0.4 × 0.5) and push real attacks under the block threshold. Damping is now skipped when 2+ distinct attack patterns fire.
+- **Residual:** a *single* attack phrase wrapped in *double* framing ("research paper" + quotes) can still pass — it's structurally identical to genuine discussion of attack techniques, and telling those apart from text alone is a known hard problem. Documented, not ignored.
+- Pattern/heuristic-based, not a trained classifier — a determined attacker avoiding known phrasing can evade it. First line of defense, not a complete solution.
+- Homoglyph detection catches mixed-script *words*, not full-script substitution.
+
+See [`Known_issues.md`](llmsentry/llmsentry/Known_issues.md) for the full technical writeups.
+
+## Project structure
+
+```
+llmsentry/llmsentry/
+  scanner.py    # core detection engine — signals, scoring, provenance weighting
+  proxy.py      # FastAPI proxy (OpenAI/Groq-compatible)
+  client.py     # library mode: guard_messages, GuardedClient
+  Known_issues.md
+llmsentry/corpus/   # labeled eval datasets (malicious.json, benign.json)
+llmsentry/eval/     # run_eval.py harness + adversarial tests
+docs/case-studies/  # incident-grounded writeups
+```
 
 ## Status
 
-This is an active work-in-progress project, not a production-hardened security tool. Contributions and issue reports welcome.
+Active work in progress. The scanner caught every attack in its eval corpus with zero false positives, but adversarial testing keeps turning up new edges — which get fixed and documented here, not hidden. Issues, repro cases, and PRs are welcome.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

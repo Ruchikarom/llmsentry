@@ -1,6 +1,7 @@
-_pycache_/ echo *.pyc git rm -r --cached llmsentry/llmsentry/_pycache_
+# Python bytecode and caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Separate local project -- not part of this repo
 invalidate/
-__pycache__/
-*.pyc
-__pycache__/
-*.pyc

@@ -188,13 +188,25 @@ def _scan_instruction_override(text: str) -> Optional[Signal]:
     # rather than issued as a live instruction. Meta-discourse and quoting
     # can stack (e.g. a quoted phrase inside a "research paper" sentence),
     # so apply both checks independently rather than picking one.
+    #
+    # The damping is attacker-controllable framing: the meta-discourse
+    # phrases and the quoting heuristic are public in this repo, so an
+    # attacker can wrap any payload in "research paper" framing + quotes to
+    # force the discount and slip under the block threshold. Skip damping
+    # when 2+ distinct patterns fire -- stacked attack patterns inside
+    # "benign" framing are almost certainly a live payload in costume,
+    # not genuine discussion.
     damping = 1.0
     is_meta = bool(_META_DISCOURSE_RE.search(text))
     is_quoted = _is_quoted(text, hit.start(), hit.end())
-    if is_meta:
-        damping *= _META_DISCOURSE_DAMPING
-    if is_quoted:
-        damping *= _QUOTE_DAMPING
+    if distinct_hits < 2:
+        if is_meta:
+            damping *= _META_DISCOURSE_DAMPING
+        if is_quoted:
+            damping *= _QUOTE_DAMPING
+    else:
+        is_meta = False
+        is_quoted = False
     weight *= damping
 
     detail = (

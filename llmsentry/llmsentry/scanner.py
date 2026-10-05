@@ -70,6 +70,10 @@ _INSTRUCTION_OVERRIDE_PATTERNS = [
     r"\bnew instructions?:\s",
     r"\bsystem\s*:\s*",
     r"\[system\]",
+    # Bracketed authority framing: "[System Note: ...]", "[Admin Override: ...]",
+    # "[Internal: ...]". The bare "\[system\]" pattern above misses these variants,
+    # which are a common costume for injected instructions.
+    r"\[(system|admin|developer|internal|security|moderator)\b[^\]]*\]",
     r"<\s*system\s*>",
     r"\bact as (if you|though)\b",
     r"\boverride (your|all) (instructions|guidelines|rules)\b",
@@ -168,16 +172,17 @@ def _scan_instruction_override(text: str) -> Optional[Signal]:
     # is a stronger signal than one that only hits a single pattern, and
     # should score accordingly instead of being capped at the same weight
     # as a single, ambiguous match.
+    scan_text = re.sub(r"\s+", " ", text)
     matches = [
         m for pattern in _INSTRUCTION_PATTERNS_COMPILED
-        for m in [pattern.search(text)] if m
+        for m in [pattern.search(scan_text)] if m
     ]
     if not matches:
         return None
 
     distinct_hits = len(matches)
     hit = matches[0]
-    snippet = text[max(0, hit.start() - 15): hit.end() + 15]
+    snippet = scan_text[max(0, hit.start() - 15): hit.end() + 15]
 
     # Base weight for a single match stays at 0.6 (unchanged behavior for
     # the common single-pattern case). Each additional distinct pattern
@@ -197,8 +202,8 @@ def _scan_instruction_override(text: str) -> Optional[Signal]:
     # "benign" framing are almost certainly a live payload in costume,
     # not genuine discussion.
     damping = 1.0
-    is_meta = bool(_META_DISCOURSE_RE.search(text))
-    is_quoted = _is_quoted(text, hit.start(), hit.end())
+    is_meta = bool(_META_DISCOURSE_RE.search(scan_text))
+    is_quoted = _is_quoted(scan_text, hit.start(), hit.end())
     if distinct_hits < 2:
         if is_meta:
             damping *= _META_DISCOURSE_DAMPING
@@ -492,7 +497,7 @@ def _scan_destructive_action(text: str) -> Optional[Signal]:
     return Signal(
         name="destructive_action",
         weight=weight,
-        detail=detail,
+        detail=f"matched {distinct_hits} destructive command pattern(s), e.g. near: ...{snippet}...",
     )
 
 
@@ -563,7 +568,7 @@ def scan(text: str, source: SourceType = SourceType.USER_INPUT) -> ScanResult:
     """Scan a piece of content for injection/obfuscation signals.
 
     Args:
-        text: the content to scan (tool output, doc chunk, user message, etc.)
+        text: the content to scan (tool output, doc chunk, user message etc.)
         source: where this content came from -- drives trust weighting.
 
     Returns:

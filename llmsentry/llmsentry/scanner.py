@@ -497,7 +497,7 @@ def _scan_destructive_action(text: str) -> Optional[Signal]:
     return Signal(
         name="destructive_action",
         weight=weight,
-        detail=f"matched {distinct_hits} destructive command pattern(s), e.g. near: ...{snippet}...",
+        detail=detail,
     )
 
 

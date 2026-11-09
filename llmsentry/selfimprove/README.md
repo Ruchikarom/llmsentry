@@ -26,13 +26,13 @@ The held-out set is only useful while it stays unseen. Each scoring pass spends 
 ## Run it
 
 ```bash
-export ANTHROPIC_API_KEY=...        # your key; it is never written to the repo
+export GEMINI_API_KEY=...           # your key; it is never written to the repo
 cd llmsentry                        # the project dir, the one containing llmsentry/
-python3 -m selfimprove.loop --dry-run   # see what it proposes first
-python3 -m selfimprove.loop             # real run; commits accepted rounds
+python3 -m selfimprove.loop --dry-run --rounds 2   # see what it proposes first
+python3 -m selfimprove.loop                        # real run; commits accepted rounds
 ```
 
-Options: `--model` (default `claude-sonnet-5-5`), `--rounds` (8), `--max-rejects` (3), `--threshold` (0.40), `--dev`, `--heldout`, `--orig`, `--out`.
+Options: `--provider` (`gemini` by default, or `anthropic`, which reads `ANTHROPIC_API_KEY`), `--model` (defaults to `gemini-3.8-flash` or `claude-sonnet-5-5`, depending on the provider), `--rounds` (8), `--max-rejects` (3), `--threshold` (0.40), `--dev`, `--heldout`, `--orig`, `--out`.
 
 Each run writes to `selfimprove/runs/<timestamp>/`, which is git-ignored:
 - `rounds.jsonl`: one row per round, plus the baseline and held-out counts.
@@ -42,10 +42,10 @@ Each run writes to `selfimprove/runs/<timestamp>/`, which is git-ignored:
 ## Tests
 
 ```bash
-python3 -m unittest selfimprove.test_loop -v
+python3 -m unittest selfimprove.test_loop selfimprove.test_proposer -v
 ```
 
-These use a fake scanner in a throwaway git repo. They make no model calls.
+These use a fake scanner in a throwaway git repo and a fake HTTP call. They make no model calls.
 
 ## Caveats
 

@@ -25,10 +25,11 @@ from pathlib import Path
 from . import patching
 from .corpus import load_set
 from .prompt import SYSTEM, build_user_prompt
-from .proposer import AnthropicProposer, StubProposer
+from .proposer import AnthropicProposer, GeminiProposer, StubProposer
 from .scorer import evaluate
 
 PROJECT = Path(__file__).resolve().parents[1]
+DEFAULT_MODELS = {"gemini": "gemini-3.8-flash", "anthropic": "claude-sonnet-5-5"}
 
 
 @dataclass
@@ -240,7 +241,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-rejects", type=int, default=3)
     ap.add_argument("--max-misses", type=int, default=8)
     ap.add_argument("--max-fps", type=int, default=6)
-    ap.add_argument("--model", default="claude-sonnet-5-5")
+    ap.add_argument("--provider", choices=sorted(DEFAULT_MODELS), default="gemini",
+                    help="which API proposes changes (default: gemini)")
+    ap.add_argument("--model", default=None,
+                    help="model name (default: gemini-3.8-flash or claude-sonnet-5-5, by provider)")
     ap.add_argument("--dry-run", action="store_true", help="propose and score, but never commit")
     ap.add_argument("--stub-replies", type=Path, default=None,
                     help="JSON list of canned replies (tests and dry runs only)")
@@ -257,12 +261,15 @@ def main(argv: list[str] | None = None) -> int:
         threshold=a.threshold, rounds=a.rounds, max_rejects=a.max_rejects,
         max_misses=a.max_misses, max_fps=a.max_fps, dry_run=a.dry_run,
     )
+    model = a.model or DEFAULT_MODELS[a.provider]
     if a.stub_replies:
         proposer = StubProposer(json.loads(a.stub_replies.read_text(encoding="utf-8")))
     elif a.rounds == 0:
         proposer = StubProposer([])  # baseline only: no model call, no API key needed
+    elif a.provider == "gemini":
+        proposer = GeminiProposer(model)
     else:
-        proposer = AnthropicProposer(a.model)
+        proposer = AnthropicProposer(model)
     print(json.dumps(run(cfg, proposer), indent=2))
     return 0
 

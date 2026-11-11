@@ -19,6 +19,7 @@ Design goals:
 from __future__ import annotations
 
 import base64
+import json
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -33,6 +34,8 @@ class SourceType(str, Enum):
     RETRIEVED_DOC = "retrieved_doc"
     WEB_CONTENT = "web_content"
     SYSTEM = "system"
+    TOOL_CALL = "tool_call"              # arguments an agent passes to a tool
+    TOOL_DEFINITION = "tool_definition"  # name/description/schema of a tool
 
 
 @dataclass
@@ -513,6 +516,8 @@ _SOURCE_TRUST_MULTIPLIER = {
     SourceType.TOOL_OUTPUT: 1.2,
     SourceType.RETRIEVED_DOC: 1.3,
     SourceType.WEB_CONTENT: 1.4,    # least trusted -- open internet content
+    SourceType.TOOL_CALL: 1.2,
+    SourceType.TOOL_DEFINITION: 1.3,
 }
 
 # Some signals are dangerous regardless of who said them -- a direct
@@ -630,4 +635,15 @@ def scan_messages(messages: list[dict]) -> list[ScanResult]:
         elif isinstance(source, str):
             source = SourceType(source)
         results.append(scan(content, source=source))
+        # Tool-call arguments are attacker-reachable content (the model can be
+        # steered into writing injected text into them), so scan them too.
+        # Previously only `content` was read, so the same phrase scored 0.00
+        # inside arguments and 0.80 as assistant content.
+        for call in msg.get("tool_calls") or []:
+            fn = call.get("function", call) if isinstance(call, dict) else {}
+            args = fn.get("arguments", "")
+            if not isinstance(args, str):
+                args = json.dumps(args, ensure_ascii=False)
+            if args:
+                results.append(scan(args, source=SourceType.TOOL_CALL))
     return results

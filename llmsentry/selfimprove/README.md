@@ -32,7 +32,9 @@ python3 -m selfimprove.loop --dry-run --rounds 2   # see what it proposes first
 python3 -m selfimprove.loop                        # real run; commits accepted rounds
 ```
 
-Options: `--provider` (`gemini` by default, or `anthropic`, which reads `ANTHROPIC_API_KEY`), `--model` (defaults to `gemini-3.8-flash` or `claude-sonnet-5-5`, depending on the provider), `--rounds` (8), `--max-rejects` (3), `--threshold` (0.40), `--dev`, `--heldout`, `--orig`, `--out`.
+Options: `--provider` (`gemini` by default, `anthropic` (reads `ANTHROPIC_API_KEY`), or `openrouter` (reads `OPENROUTER_API_KEY`)), `--model` (defaults to `gemini-3.8-flash` or `claude-sonnet-5-5`; required for `openrouter`), `--fallback PROVIDER[:MODEL]` (repeatable; tried in order when the primary gives no answer), `--retries` (4 extra attempts per provider on overload, rate-limit or network errors), `--retry-delay` (10 seconds, doubling), `--max-api-failures` (3), `--rounds` (8), `--max-rejects` (3), `--threshold` (0.40), `--dev`, `--heldout`, `--orig`, `--out`.
+
+A backup for when the primary is overloaded: `--fallback openrouter:<model-id>`, where the ID is a `:free` model from openrouter.ai/models that is available on the day of the run.
 
 Each run writes to `selfimprove/runs/<timestamp>/`, which is git-ignored:
 - `rounds.jsonl`: one row per round, plus the baseline and held-out counts.
@@ -49,6 +51,8 @@ These use a fake scanner in a throwaway git repo and a fake HTTP call. They make
 
 ## Caveats
 
-- Each round is one model call. With the defaults, a run makes at most 8.
+- Each round asks the provider chain for one answer. An overload, rate limit or network error is retried with backoff, then the next `--fallback` provider is tried. A round that still gets no answer is skipped. It is not a rejected proposal, so it does not count toward `--max-rejects`. Skipped rounds do use up `--rounds`.
+- Groq's free tier does not fit this loop. Its published limit is about 8,000 tokens a minute. One proposer prompt is about 31 KB of text, probably around 9,000 tokens.
+- A run makes at most `--rounds` rounds (8 by default), so daily caps rarely bind. Per-minute limits and overloads are what stall a run.
 - The dev set was written by a fresh writer session, so it reflects that writer's style. Review it before you trust it.
 - Gains on dev may not carry over to held-out. Check the held-out counts once, at the end. If they stay low, the scanner is overfitting to the dev examples.

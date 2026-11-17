@@ -7,6 +7,10 @@ improves with no regression on either set. The held-out set is scored at
 baseline, and again at the end if anything was accepted. Its results are
 logged as counts only, and it is never shown to the proposer.
 
+A round where no provider answers is skipped. That is not a rejected proposal,
+so it does not count toward max_rejects and never reaches the proposer's
+history.
+
 Run from the project directory (the one containing llmsentry/):
     python3 -m selfimprove.loop --dev corpus/dev_2026-11-02
 """
@@ -25,11 +29,13 @@ from pathlib import Path
 from . import patching
 from .corpus import load_set
 from .prompt import SYSTEM, build_user_prompt
-from .proposer import AnthropicProposer, GeminiProposer, StubProposer
+from .proposer import (OPENROUTER_URL, AnthropicProposer, FallbackProposer, GeminiProposer,
+                       OpenAICompatProposer, ProviderError, StubProposer)
 from .scorer import evaluate
 
 PROJECT = Path(__file__).resolve().parents[1]
-DEFAULT_MODELS = {"gemini": "gemini-3.8-flash", "anthropic": "claude-sonnet-5-5"}
+# openrouter has no default: its free models change often, so name one on purpose.
+DEFAULT_MODELS = {"gemini": "gemini-3.8-flash", "anthropic": "claude-sonnet-5-5", "openrouter": None}
 
 
 @dataclass
@@ -44,6 +50,7 @@ class Config:
     max_rejects: int = 3
     max_misses: int = 8
     max_fps: int = 6
+    max_api_failures: int = 3  # stop after this many rounds in a row with no answer
     dry_run: bool = False
 
 
@@ -91,11 +98,8 @@ def _fields(res: dict) -> dict:
     return {"score": res["score"], "signals": res["signals"], "error": res["error"]}
 
 
-def _propose(proposer, user: str, texts: dict[str, str]) -> tuple[str | None, str | None]:
-    try:
-        reply = proposer.propose(SYSTEM, user)
-    except Exception as exc:  # an API error ends this round only
-        return None, f"proposer error: {exc}"
+def _check_reply(reply: str, texts: dict[str, str]) -> tuple[str | None, str | None]:
+    """The diff in a proposer's reply, or the reason the reply cannot be used."""
     diff = patching.extract_diff(reply)
     if diff is None:
         return None, "reply had no ```diff block"
@@ -166,7 +170,7 @@ def run(cfg: Config, proposer, evaluate_fn=evaluate, tester=run_tests, log=print
         rec.write("heldout_baseline", **counts)
 
     history: list[str] = []
-    rejects = accepted = 0
+    rejects = accepted = api_skips = api_failures = 0
     stop = "baseline only" if cfg.rounds == 0 else "rounds exhausted"
     for rnd in range(1, cfg.rounds + 1):
         _, dev_misses, dev_fps = summarize(dev, res_dev, cfg.threshold)
@@ -179,7 +183,26 @@ def run(cfg: Config, proposer, evaluate_fn=evaluate, tester=run_tests, log=print
         user = build_user_prompt(scanner_src, misses, fps, history)
         (cfg.out / "prompts" / f"round_{rnd:02d}.txt").write_text(user, encoding="utf-8")
 
-        diff, reason = _propose(proposer, user, texts)
+        try:
+            reply = proposer.propose(SYSTEM, user)
+        except Exception as exc:
+            # No provider answered. That is an outage or a refusal, not a rejected
+            # proposal, so it stays out of max_rejects and out of the history.
+            api_skips += 1
+            api_failures += 1
+            transient = exc.transient if isinstance(exc, ProviderError) else True
+            rec.write("round", round=rnd, outcome="skipped_no_answer", reason=str(exc)[:500],
+                      provider=proposer.name)
+            if not transient:
+                stop = "providers refused the request; retrying will not help"
+                break
+            if api_failures >= cfg.max_api_failures:
+                stop = f"no provider answered {api_failures} rounds in a row"
+                break
+            continue
+        api_failures = 0
+
+        diff, reason = _check_reply(reply, texts)
         passed, after = False, None
         if reason is None:
             ok, err = patching.apply_diff(root, diff, cfg.out)
@@ -207,6 +230,7 @@ def run(cfg: Config, proposer, evaluate_fn=evaluate, tester=run_tests, log=print
                 rejects += 1
                 history.append(reason)
         rec.write("round", round=rnd, outcome=outcome, reason=reason or "", diff_sha=digest,
+                  provider=proposer.name,
                   dev_after=after["dev"] if after else None,
                   orig_after=after["orig"] if after else None)
         if rejects >= cfg.max_rejects:
@@ -217,11 +241,25 @@ def run(cfg: Config, proposer, evaluate_fn=evaluate, tester=run_tests, log=print
         counts = summarize(held, score_set(cfg, held, evaluate_fn), cfg.threshold)[0]
         rec.write("heldout_final", **counts)
 
-    summary = {"accepted": accepted, "stop": stop, "branch": branch,
-               "dry_run": cfg.dry_run, "out": str(cfg.out), "final_dev": cur["dev"]}
+    summary = {"accepted": accepted, "stop": stop, "branch": branch, "dry_run": cfg.dry_run,
+               "api_skips": api_skips, "out": str(cfg.out), "final_dev": cur["dev"]}
     (cfg.out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     rec.write("done", accepted=accepted, stop=stop, branch=branch, dry_run=cfg.dry_run)
     return summary
+
+
+def build_proposer(spec: str):
+    """`gemini[:MODEL]`, `anthropic[:MODEL]` or `openrouter:MODEL`."""
+    provider, _, model = spec.partition(":")
+    if provider == "gemini":
+        return GeminiProposer(model or DEFAULT_MODELS["gemini"])
+    if provider == "anthropic":
+        return AnthropicProposer(model or DEFAULT_MODELS["anthropic"])
+    if provider == "openrouter":
+        if not model:
+            raise ValueError("openrouter needs a model ID, as in openrouter:vendor/model:free")
+        return OpenAICompatProposer("openrouter", OPENROUTER_URL, "OPENROUTER_API_KEY", model)
+    raise ValueError(f"unknown provider '{provider}'")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -241,10 +279,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-rejects", type=int, default=3)
     ap.add_argument("--max-misses", type=int, default=8)
     ap.add_argument("--max-fps", type=int, default=6)
+    ap.add_argument("--max-api-failures", type=int, default=3,
+                    help="stop after this many rounds in a row with no answer (default: 3)")
     ap.add_argument("--provider", choices=sorted(DEFAULT_MODELS), default="gemini",
-                    help="which API proposes changes (default: gemini)")
+                    help="primary API that proposes changes (default: gemini)")
     ap.add_argument("--model", default=None,
-                    help="model name (default: gemini-3.8-flash or claude-sonnet-5-5, by provider)")
+                    help="primary model (default: gemini-3.8-flash or claude-sonnet-5-5; required for openrouter)")
+    ap.add_argument("--fallback", action="append", default=[], metavar="PROVIDER[:MODEL]",
+                    help="backup tried in order when the primary gives no answer; repeatable")
+    ap.add_argument("--retries", type=int, default=4,
+                    help="extra attempts per provider on overload, rate limit or network error (default: 4)")
+    ap.add_argument("--retry-delay", type=float, default=10.0,
+                    help="seconds before the first retry; doubles each time (default: 10)")
     ap.add_argument("--dry-run", action="store_true", help="propose and score, but never commit")
     ap.add_argument("--stub-replies", type=Path, default=None,
                     help="JSON list of canned replies (tests and dry runs only)")
@@ -259,17 +305,26 @@ def main(argv: list[str] | None = None) -> int:
         heldout=(a.heldout or project / "corpus" / "heldout_2026-11-02").resolve(),
         out=(a.out or project / "selfimprove" / "runs" / stamp).resolve(),
         threshold=a.threshold, rounds=a.rounds, max_rejects=a.max_rejects,
-        max_misses=a.max_misses, max_fps=a.max_fps, dry_run=a.dry_run,
+        max_misses=a.max_misses, max_fps=a.max_fps, max_api_failures=a.max_api_failures,
+        dry_run=a.dry_run,
     )
-    model = a.model or DEFAULT_MODELS[a.provider]
+
+    def say(msg: str) -> None:
+        print(msg, file=sys.stderr)
+
     if a.stub_replies:
         proposer = StubProposer(json.loads(a.stub_replies.read_text(encoding="utf-8")))
     elif a.rounds == 0:
         proposer = StubProposer([])  # baseline only: no model call, no API key needed
-    elif a.provider == "gemini":
-        proposer = GeminiProposer(model)
     else:
-        proposer = AnthropicProposer(model)
+        try:
+            primary = a.provider + (f":{a.model}" if a.model else "")
+            chain = [build_proposer(spec) for spec in [primary, *a.fallback]]
+        except (RuntimeError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        say("providers, in order: " + " -> ".join(p.name for p in chain))
+        proposer = FallbackProposer(chain, retries=a.retries, base_delay=a.retry_delay, log=say)
     print(json.dumps(run(cfg, proposer), indent=2))
     return 0
 
